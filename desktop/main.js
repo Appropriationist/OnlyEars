@@ -101,6 +101,17 @@ const APP_PACKAGE_INFO = (() => {
 })();
 const APP_METADATA = APP_PACKAGE_INFO.mineradio || {};
 const APP_NAME = process.env.MINERADIO_RUNTIME_NAME || APP_METADATA.runtimeName || APP_PACKAGE_INFO.productName || 'Mineradio';
+
+/* ==========================================================================
+   窗口标题
+   --------------------------------------------------------------------------
+   不能用 APP_NAME（它取自 productName = Mineradio），
+   因为改 productName 会让 %APPDATA%\Mineradio 变成 %APPDATA%\OnlyEars，
+   用户的播放历史和歌单会丢失。
+
+   所以单独定义窗口标题，只影响显示，不影响数据目录。
+   ========================================================================== */
+const WINDOW_TITLE = process.env.MINERADIO_WINDOW_TITLE || 'OnlyEars · 音乐播放器';
 const APP_USER_MODEL_ID = process.env.MINERADIO_APP_USER_MODEL_ID || APP_METADATA.appUserModelId || (APP_PACKAGE_INFO.build && APP_PACKAGE_INFO.build.appId) || 'com.mineradio.desktop';
 const APP_ICON_ICO = path.join(__dirname, '..', 'build', 'icon.ico');
 const CURRENT_FX_AUTOSAVE_FILE = 'current-fx-autosave.json';
@@ -3768,7 +3779,7 @@ function createDesktopLyricsWindow(payload = {}) {
     focusable: false,
     skipTaskbar: true,
     show: false,
-    title: 'Mineradio Desktop Lyrics',
+    title: 'OnlyEars 桌面歌词',
     webPreferences: {
       preload: path.join(__dirname, 'overlay-preload.js'),
       contextIsolation: true,
@@ -4157,7 +4168,7 @@ ipcMain.handle('mineradio-cache-get-settings', async () => {
 
 ipcMain.handle('mineradio-cache-choose-directory', async () => {
   const result = await dialog.showOpenDialog({
-    title: '选择 Mineradio 缓存目录',
+    title: '选择 OnlyEars 缓存目录',
     defaultPath: cacheSettings.rootPath,
     properties: ['openDirectory', 'createDirectory'],
   });
@@ -4922,7 +4933,7 @@ ipcMain.handle('mineradio-export-json-file', async (event, payload = {}) => {
     const owner = getSenderWindow(event);
     const defaultName = String(payload.defaultName || 'mineradio-export.json').replace(/[\\/:*?"<>|]+/g, '-');
     const result = await dialog.showSaveDialog(owner, {
-      title: '导出 Mineradio 存档',
+      title: '导出 OnlyEars 存档',
       defaultPath: defaultName.toLowerCase().endsWith('.json') ? defaultName : `${defaultName}.json`,
       filters: [{ name: 'JSON', extensions: ['json'] }],
     });
@@ -4939,7 +4950,7 @@ ipcMain.handle('mineradio-import-json-file', async (event) => {
   try {
     const owner = getSenderWindow(event);
     const result = await dialog.showOpenDialog(owner, {
-      title: '导入 Mineradio 存档',
+      title: '导入 OnlyEars 存档',
       properties: ['openFile'],
       filters: [{ name: 'JSON', extensions: ['json'] }],
     });
@@ -5755,7 +5766,7 @@ async function createWindowOnce() {
     backgroundColor: '#00000000',
     hasShadow: true,
     autoHideMenuBar: true,
-    title: APP_NAME,
+    title: WINDOW_TITLE,
     icon: APP_ICON_ICO,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),

@@ -89,7 +89,7 @@ function openFeedbackPanel() {
   if (meta) {
     var ua = navigator.userAgent || '';
     var chrome = (ua.match(/Chrome\/(\d+)/) || [])[1] || '';
-    meta.textContent = 'OnlyEars · 基于 Mineradio 创作' +
+    meta.textContent = 'OnlyEars · 音乐播放器 · 基于 Mineradio 创作' +
       (chrome ? ' · Electron ' + chrome : '');
   }
 }
