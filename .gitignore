@@ -1,0 +1,29 @@
+# 依赖
+node_modules/
+
+# 运行时数据（用户数据，不进仓库）
+data/
+*.log
+
+# 用户 Cookie / 登录态
+.cookie
+.qq-cookie
+.kugou-cookie
+.qishui-cookie
+*.qishui-qr-login.json
+
+# 打包产物
+dist/
+out/
+*.exe
+*.zip
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

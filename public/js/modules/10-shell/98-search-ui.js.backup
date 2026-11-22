@@ -1,0 +1,1363 @@
+/* ==========================================================================
+   搜索 UI：模式切换 + 下拉框 + 整页搜索 + 找音源页
+   --------------------------------------------------------------------------
+   交互设计：
+     搜索栏左侧下拉：精确 / 模糊
+       precise → 走曲库（QQ 音乐），出标准曲目
+       fuzzy   → 直接搜 B 站视频
+
+     下拉框（随手搜）：最多渲染 20 条，可视 6 行，滚轮滚动
+       最后一行固定「使用模糊搜索查看更多」
+       点歌 → 直接播（后台自动选最高分音源）
+
+     整页搜索（回车 / 点放大镜）：全屏列表
+       点歌 → 进「找音源页」（N 个候选，带分数/理由，自己挑）
+   ========================================================================== */
+
+var SEARCH_UI = {
+  mode: 'precise',
+  lastQuery: '',
+  lastResults: [],
+  dropLimit: 6,
+  pageOpen: false,
+  busy: false,
+  page: 1,
+  hasMore: false,
+};
+
+var SRC_PAGE = {
+  song: null,
+  candidates: [],
+  autoPlayTimer: null,
+  requestId: 0,
+  fromSearchPage: false,
+};
+
+/* ---------------------------------------------------------------- 工具 */
+function biliEsc(s) {
+  if (typeof escHtml === 'function') return escHtml(String(s == null ? '' : s));
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function biliApiJson(url, opts) {
+  if (typeof apiJson === 'function') return apiJson(url, opts);
+  return fetch(url, { signal: (opts && opts.signal) }).then(function (r) { return r.json(); });
+}
+
+function biliFmtTime(sec) {
+  sec = Math.max(0, Math.floor(Number(sec) || 0));
+  var m = Math.floor(sec / 60), s = sec % 60;
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+/* ---------------------------------------------------------------- 模式 */
+function setSearchUiMode(mode) {
+  SEARCH_UI.mode = (mode === 'fuzzy') ? 'fuzzy' : 'precise';
+  var label = document.getElementById('sms-label');
+  if (label) label.textContent = SEARCH_UI.mode === 'fuzzy' ? '模糊' : '精确';
+
+  var items = document.querySelectorAll('#sms-menu .sms-item');
+  for (var i = 0; i < items.length; i++) {
+    items[i].classList.toggle('on', items[i].getAttribute('data-smode') === SEARCH_UI.mode);
+  }
+  var items2 = document.querySelectorAll('#search-page-mode .spm-item');
+  for (var j = 0; j < items2.length; j++) {
+    items2[j].classList.toggle('on', items2[j].getAttribute('data-smode') === SEARCH_UI.mode);
+  }
+
+  var ph = SEARCH_UI.mode === 'fuzzy'
+    ? '搜索 B 站视频（歌名、UP 主、关键词）...'
+    : '搜索歌曲、歌手...';
+  var i1 = document.getElementById('search-input');
+  var i2 = document.getElementById('search-page-input');
+  if (i1) i1.placeholder = ph;
+  if (i2) i2.placeholder = ph;
+}
+
+function toggleSearchModeSelect(e) {
+  if (e) { e.stopPropagation(); e.preventDefault(); }
+  var wrap = document.getElementById('search-mode-select');
+  if (!wrap) return;
+  var open = wrap.classList.toggle('open');
+  wrap.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function pickSearchMode(mode) {
+  setSearchUiMode(mode);
+  var wrap = document.getElementById('search-mode-select');
+  if (wrap) {
+    wrap.classList.remove('open');
+    wrap.setAttribute('aria-expanded', 'false');
+  }
+  var inp = document.getElementById('search-input');
+  var q = inp ? inp.value.trim() : '';
+  if (q) runSearchUi(q, { forDropdown: true });
+}
+
+function pickSearchModeFromPage(mode) {
+  setSearchUiMode(mode);
+  var inp = document.getElementById('search-page-input');
+  var q = inp ? inp.value.trim() : SEARCH_UI.lastQuery;
+  if (q) runSearchUi(q, { forPage: true, page: 1 });
+}
+
+/* ---------------------------------------------------------------- 搜索 */
+async function runSearchUi(q, opts) {
+  opts = opts || {};
+  q = String(q || '').trim();
+  if (!q) return;
+
+  if (opts.page) SEARCH_UI.page = Math.max(1, opts.page);
+  else if (q !== SEARCH_UI.lastQuery) SEARCH_UI.page = 1;
+
+  SEARCH_UI.lastQuery = q;
+  SEARCH_UI.busy = true;
+
+  var url;
+  if (SEARCH_UI.mode === 'fuzzy') {
+    url = '/api/bili/raw?keywords=' + encodeURIComponent(q) + '&page=' + SEARCH_UI.page;
+  } else {
+    var offset = (SEARCH_UI.page - 1) * 30;
+    url = '/api/bili/search?keywords=' + encodeURIComponent(q) + '&limit=30&offset=' + offset;
+  }
+
+  try {
+    var r = await biliApiJson(url, { timeoutMs: 30000 });
+    var songs = (r && r.songs && r.songs.length !== undefined) ? r.songs : [];
+    SEARCH_UI.lastResults = songs;
+    SEARCH_UI.hasMore = !!(r && r.hasMore);
+    SEARCH_UI.busy = false;
+
+    if (opts.forDropdown) {
+      renderSearchDropdown(q, songs);
+    } else if (opts.forPage) {
+      renderSearchPageList(q, songs);
+      renderSearchPager();
+    } else {
+      renderSearchDropdown(q, songs);
+      if (SEARCH_UI.pageOpen) {
+        renderSearchPageList(q, songs);
+        renderSearchPager();
+      }
+    }
+  } catch (err) {
+    SEARCH_UI.busy = false;
+    console.warn('[search]', err);
+    var msg = '搜索失败，请稍后重试';
+    if (opts.forDropdown) {
+      var box = document.getElementById('search-results');
+      if (box) {
+        box.innerHTML = '<div class="search-empty">' + biliEsc(msg) + '</div>';
+        box.classList.add('show');
+      }
+    } else {
+      var st = document.getElementById('search-page-status');
+      if (st) st.textContent = msg;
+    }
+  }
+}
+
+/* ---------------------------------------------------------------- 下拉 */
+function renderSearchDropdown(q, songs) {
+  var box = document.getElementById('search-results');
+  if (!box) return;
+
+  if (!songs.length) {
+    box.innerHTML = '<div class="search-empty">没有找到相关歌曲</div>';
+    box.classList.add('show');
+    return;
+  }
+
+  var shown = songs.slice(0, 20);
+  var html = '';
+  for (var i = 0; i < shown.length; i++) html += searchDropRowHtml(shown[i], i);
+
+  var moreLabel = SEARCH_UI.mode === 'fuzzy'
+    ? '在整页中查看全部结果'
+    : '使用模糊搜索查看更多';
+  html += '<button type="button" class="search-more-row" onclick="dropdownMoreAction()">' +
+            '<span>' + biliEsc(moreLabel) + '</span>' +
+            '<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+              '<path d="M9 18l6-6-6-6"/></svg>' +
+          '</button>';
+
+  box.innerHTML = html;
+  box.classList.add('show');
+
+  var rows = box.querySelectorAll('[data-drop-idx]');
+  for (var k = 0; k < rows.length; k++) {
+    (function (el) {
+      el.addEventListener('click', function () {
+        var idx = parseInt(el.getAttribute('data-drop-idx'), 10);
+        var s = shown[idx];
+        if (s) playFromSearch(s, true);
+      });
+    })(rows[k]);
+  }
+}
+
+function searchDropRowHtml(s, i) {
+  var cover = s.cover || s.picUrl || '';
+  var img = cover
+    ? '<img src="' + biliEsc(cover) + '" alt="" loading="lazy" onerror="this.style.opacity=.2">'
+    : '<div class="sd-ph"></div>';
+  var sub = [];
+  if (s.artist) sub.push(s.artist);
+  if (s.album) sub.push(s.album);
+  if (s.duration_s) sub.push(biliFmtTime(s.duration_s));
+
+  return '<div class="search-drop-row" data-drop-idx="' + i + '">' +
+      img +
+      '<div class="sd-info">' +
+        '<div class="sd-title">' + biliEsc(s.name || '') +
+          '<span class="tag-source bili">B站</span></div>' +
+        '<div class="sd-meta">' + biliEsc(sub.join(' · ')) + '</div>' +
+      '</div>' +
+      /* 行尾三个按钮：下载、加入歌单、播放 */
+      '<button class="sd-btn" type="button" title="下载" ' +
+        'data-dl-song="' + encodeURIComponent(JSON.stringify({bvid: s.bvid||"", cid: s.cid||0, name: s.name||"", artist: s.artist||"", duration: s.duration||0})) + '"' +
+        ' onclick="event.stopPropagation()">' +
+        '<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+          '<path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M5 21h14"/></svg>' +
+      '</button>' +
+      '<button class="sd-btn" type="button" title="加入歌单" ' +
+        'onclick="event.stopPropagation();showAddToPlaylistMenu(this, ' +
+          'SEARCH_UI.lastResults[' + i + '])">' +
+        '<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+          '<path d="M12 5v14"/><path d="M5 12h14"/></svg>' +
+      '</button>' +
+      '<button class="sd-play" type="button" title="播放">' +
+        '<svg width="13" height="13" fill="currentColor" viewBox="0 0 24 24">' +
+          '<path d="M8 5v14l11-7z"/></svg>' +
+      '</button>' +
+    '</div>';
+}
+
+function dropdownMoreAction() {
+  if (SEARCH_UI.mode === 'precise') {
+    setSearchUiMode('fuzzy');
+    runSearchUi(SEARCH_UI.lastQuery, { forDropdown: true });
+  } else {
+    openSearchPage(SEARCH_UI.lastQuery);
+  }
+}
+
+/* ---------------------------------------------------------------- 整页 */
+function openSearchPage(q) {
+  var page = document.getElementById('search-page');
+  if (!page) return;
+  SEARCH_UI.pageOpen = true;
+  page.classList.add('show');
+  page.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('search-page-open');
+
+  /* 播放条常驻：直接去 class 并持续保持 */
+  startBottomBarGuard();
+
+  var inp = document.getElementById('search-page-input');
+  if (inp) {
+    inp.value = q || SEARCH_UI.lastQuery || '';
+    setTimeout(function () {
+      try { inp.focus(); } catch (e) {}
+    }, 60);
+  }
+
+  var query = q || SEARCH_UI.lastQuery;
+  if (query) runSearchUi(query, { forPage: true, page: 1 });
+
+  var box = document.getElementById('search-results');
+  if (box) box.classList.remove('show');
+}
+
+function closeSearchPage() {
+  var page = document.getElementById('search-page');
+  if (!page) return;
+  SEARCH_UI.pageOpen = false;
+  page.classList.remove('show');
+  page.setAttribute('aria-hidden', 'true');
+  stopBottomBarGuard();
+
+  var sp = document.getElementById('source-page');
+  var spOpen = !!(sp && sp.classList.contains('show'));
+  if (!spOpen) document.body.classList.remove('search-page-open');
+}
+
+function renderSearchPageList(q, songs) {
+  var list = document.getElementById('search-page-list');
+  var status = document.getElementById('search-page-status');
+  if (!list) return;
+
+  if (status) {
+    status.textContent = songs.length ? ('「' + q + '」 · ' + songs.length + ' 个结果') : '';
+  }
+
+  if (!songs.length) {
+    list.innerHTML = '<div class="search-empty">没有找到相关歌曲</div>';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < songs.length; i++) html += searchPageRowHtml(songs[i], i);
+  list.innerHTML = html;
+
+  var rows = list.querySelectorAll('[data-page-idx]');
+  for (var k = 0; k < rows.length; k++) {
+    (function (el) {
+      el.addEventListener('click', function () {
+        var idx = parseInt(el.getAttribute('data-page-idx'), 10);
+        var s = songs[idx];
+        if (s) playFromSearch(s, false);
+      });
+    })(rows[k]);
+  }
+}
+
+function searchPageRowHtml(s, i) {
+  var cover = s.cover || s.picUrl || '';
+  var img = cover
+    ? '<img src="' + biliEsc(cover) + '" alt="" loading="lazy" onerror="this.style.opacity=.2">'
+    : '<div class="sd-ph"></div>';
+  var sub = [];
+  if (s.artist) sub.push(s.artist);
+  if (s.album) sub.push(s.album);
+  if (s.duration_s) sub.push(biliFmtTime(s.duration_s));
+
+  var extra = '';
+  if (s.playText) extra = '<span class="spr-play">' + biliEsc(s.playText) + '</span>';
+
+  var partsBtn = '';
+  if (SEARCH_UI.mode === 'fuzzy' && s.bvid) {
+    partsBtn = '<button class="spr-parts-btn" type="button" title="查看分P / 合集" ' +
+               'onclick="event.stopPropagation();openPartsPanel(\'' + biliEsc(s.bvid) + '\')">分P</button>';
+  }
+
+  return '<div class="search-page-row" data-page-idx="' + i + '">' +
+      img +
+      '<div class="spr-info">' +
+        '<div class="spr-title">' + biliEsc(s.name || '') +
+          '<span class="tag-source bili">B站</span>' + extra + '</div>' +
+        '<div class="spr-meta">' + biliEsc(sub.join(' · ')) + '</div>' +
+      '</div>' +
+      partsBtn +
+      '<button class="dl-btn spr-dl" type="button" title="下载" ' +
+        'data-dl-song="' + encodeURIComponent(JSON.stringify({bvid: s.bvid||"", cid: s.cid||0, name: s.name||"", artist: s.artist||"", duration: s.duration||0})) + '"' +
+        ' onclick="event.stopPropagation()">' +
+        '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+          '<path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M5 21h14"/></svg>' +
+      '</button>' +
+      '<button class="sd-btn spr-add" type="button" title="加入歌单" ' +
+        'onclick="event.stopPropagation();showAddToPlaylistMenu(this, ' +
+          'SEARCH_UI.lastResults[' + i + '])">' +
+        '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+          '<path d="M12 5v14"/><path d="M5 12h14"/></svg>' +
+      '</button>' +
+      '<button class="spr-play-btn" type="button" title="播放">' +
+        '<svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>' +
+      '</button>' +
+    '</div>';
+}
+
+/* ---------------------------------------------------------------- 分页 */
+function renderSearchPager() {
+  var list = document.getElementById('search-page-list');
+  if (!list) return;
+
+  var old = document.getElementById('search-page-pager');
+  if (old) old.parentNode.removeChild(old);
+  if (SEARCH_UI.mode !== 'fuzzy') return;
+
+  var cur = SEARCH_UI.page;
+  var hasMore = SEARCH_UI.hasMore;
+
+  var html = '<div id="search-page-pager">';
+  html += '<button class="spg-btn" ' + (cur <= 1 ? 'disabled' : '') +
+          ' onclick="gotoSearchPage(' + (cur - 1) + ')">上一页</button>';
+
+  var from = Math.max(1, cur - 2);
+  var to = Math.max(from, cur + 2);
+  for (var p = from; p <= to; p++) {
+    if (p > cur && !hasMore && p === cur + 1) break;
+    html += '<button class="spg-btn' + (p === cur ? ' on' : '') +
+            '" onclick="gotoSearchPage(' + p + ')">' + p + '</button>';
+  }
+
+  html += '<button class="spg-btn" ' + (!hasMore ? 'disabled' : '') +
+          ' onclick="gotoSearchPage(' + (cur + 1) + ')">下一页</button>';
+  html += '<span class="spg-info">第 ' + cur + ' 页</span>';
+  html += '</div>';
+
+  list.insertAdjacentHTML('beforeend', html);
+}
+
+function gotoSearchPage(p) {
+  if (p < 1) return;
+  runSearchUi(SEARCH_UI.lastQuery, { forPage: true, page: p });
+  var body = document.getElementById('search-page-body');
+  if (body) body.scrollTop = 0;
+}
+
+/* ---------------------------------------------------------------- 播放 */
+/**
+ * 点搜索结果。
+ *   fromDropdown = true  → 下拉框（随手搜）→ 直接播
+ *   fromDropdown = false → 整页（专门找）→ 精确模式进找音源页
+ * 模糊模式两者都直接播（B站视频本身就是音源）。
+ */
+/**
+ * 点搜索结果。这是两套不同的意图：
+ *
+ *   下拉框（边打字边搜，随手点）→ **直接播**
+ *       用户只是想听听这首歌，不想挑音源。
+ *
+ *   整页搜索（按回车 / 点放大镜，专门找）→ **进找音源页**
+ *       用户是特地来找这首歌的，给 N 个候选让他挑最好的。
+ *
+ * 在找音源页里选完候选 → 播放，但**不关闭找音源页**（可继续试听别的）。
+ */
+function playFromSearch(song, fromDropdown) {
+  if (!song) return;
+
+  var box = document.getElementById('search-results');
+  if (box) box.classList.remove('show');
+
+  // 下拉框：直接播
+  if (fromDropdown) {
+    // 模糊搜索有 bvid（视频本身就是音源）；精确搜索让后台自动找
+    pushAndPlay(makeBiliItem(song, SEARCH_UI.mode === 'fuzzy' ? (song.bvid || '') : '', song.cid || 0));
+    return;
+  }
+
+  // 整页：模糊搜索直接播，精确搜索进找音源页
+  if (SEARCH_UI.mode === 'fuzzy') {
+    pushAndPlay(makeBiliItem(song, song.bvid || '', song.cid || 0));
+    return;
+  }
+  openSourcePage(song);
+}
+
+function makeBiliItem(song, bvid, cid) {
+  return {
+    provider: 'bili',
+    source: 'bili',
+    type: 'song',
+    id: bvid || song.id || song.mid || '',
+    bvid: bvid || '',
+    cid: cid || 0,
+    name: song.name || song.title || '',
+    artist: song.artist || '',
+    album: song.album || '',
+    cover: song.cover || song.picUrl || '',
+    duration: song.duration || 0,
+    duration_s: song.duration_s || 0,
+    mid: song.mid || '',
+  };
+}
+
+function pushAndPlay(item) {
+  try {
+    if (typeof playQueue !== 'undefined' && typeof playQueueAt === 'function') {
+      playQueue.unshift(item);
+      currentIdx = 0;
+      playQueueAt(0);
+      showNowPlayingHint(item);
+      return;
+    }
+  } catch (e) { /* 继续尝试下一个 */ }
+  try {
+    if (typeof playSong === 'function') {
+      playSong(item);
+      showNowPlayingHint(item);
+    }
+  } catch (e) { console.warn('[pushAndPlay]', e); }
+}
+
+/**
+ * 停在搜索页时，顶部浮一条「正在播放」提示。
+ * 因为整页搜索盖住了播放栏，用户点了歌什么都看不到，会以为没反应。
+ * 3 秒后淡出。
+ */
+var _nowHintTimer = null;
+function showNowPlayingHint(item) {
+  var host = document.getElementById('bili-now-hint');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'bili-now-hint';
+    document.body.appendChild(host);
+  }
+  var name = (item && item.name) || '';
+  var artist = (item && item.artist) || '';
+  host.innerHTML =
+    '<svg width="15" height="15" fill="currentColor" viewBox="0 0 24 24">' +
+      '<path d="M8 5v14l11-7z"/></svg>' +
+    '<span class="bnh-text">正在播放：' + biliEsc(name) +
+      (artist ? '<em>' + biliEsc(artist) + '</em>' : '') + '</span>';
+
+  host.classList.add('show');
+  clearTimeout(_nowHintTimer);
+  _nowHintTimer = setTimeout(function () {
+    host.classList.remove('show');
+  }, 3200);
+}
+
+/* ==========================================================================
+   找音源页
+   ========================================================================== */
+async function openSourcePage(song) {
+  if (!song) return;
+
+  SRC_PAGE.song = song;
+  SRC_PAGE.candidates = [];
+  SRC_PAGE.fromSearchPage = SEARCH_UI.pageOpen;
+  var reqId = ++SRC_PAGE.requestId;
+
+  var page = document.getElementById('source-page');
+  if (!page) return;
+
+  page.classList.add('show');
+  page.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('search-page-open');
+
+  startBottomBarGuard();
+
+  var cover = song.cover || song.picUrl || '';
+  var title = song.name || song.title || '';
+  var artist = song.artist || '';
+  var durS = Math.round((song.duration || 0) / 1000) || song.duration_s || 0;
+
+  var head = document.getElementById('source-page-head');
+  if (head) {
+    head.innerHTML =
+      '<button id="source-page-back" type="button" onclick="closeSourcePage()" title="返回">' +
+        '<svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+          '<path d="M15 18l-6-6 6-6"/></svg>' +
+      '</button>' +
+      (cover
+        ? '<img class="sp-head-cover" src="' + biliEsc(cover) + '" alt="" onerror="this.style.display=\'none\'">'
+        : '<div class="sp-head-cover"></div>') +
+      '<div class="sp-head-info">' +
+        '<div class="sp-head-title">' + biliEsc(title) + '</div>' +
+        '<div class="sp-head-meta">' + biliEsc(artist) +
+          (durS ? ' · ' + biliFmtTime(durS) : '') + '</div>' +
+      '</div>' +
+      '<button class="sp-head-tool" type="button" onclick="refindSources()" title="重新搜索音源">' +
+        '<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+          '<path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>' +
+      '</button>' +
+      '<button class="sp-head-tool" type="button" onclick="goHomeFromSourcePage()" title="回到播放界面">' +
+        '<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+          '<path d="M3 10.8 12 3l9 7.8"/><path d="M5 10v10h14V10"/><path d="M9.5 20v-5h5v5"/></svg>' +
+      '</button>';
+  }
+
+  var status = document.getElementById('source-page-status');
+  if (status) status.textContent = '正在从 B 站搜索音源…';
+
+  var list = document.getElementById('source-page-list');
+  if (list) list.innerHTML = '';
+
+  try {
+    var url = '/api/bili/source?title=' + encodeURIComponent(title) +
+              '&artist=' + encodeURIComponent(artist) +
+              '&duration=' + encodeURIComponent(String(durS)) +
+              '&mode=balanced';
+    var r = await biliApiJson(url, { timeoutMs: 40000 });
+    if (reqId !== SRC_PAGE.requestId) return;
+
+    var cands = (r && r.candidates) ? r.candidates : [];
+    SRC_PAGE.candidates = cands;
+
+    if (status) {
+      status.textContent = cands.length
+        ? (cands.length + ' 个音源候选，按匹配度排序 · 用时 ' + (r.elapsed || 0) + 'ms')
+        : '没有找到音源';
+    }
+    renderSourceList(cands);
+
+    if (cands.length) {
+      clearTimeout(SRC_PAGE.autoPlayTimer);
+      SRC_PAGE.autoPlayTimer = setTimeout(function () {
+        if (reqId === SRC_PAGE.requestId) playSourceCandidate(0, true);
+      }, 1200);
+    }
+  } catch (e) {
+    if (status) status.textContent = '搜索失败：' + (e && e.message ? e.message : '');
+  }
+}
+
+function renderSourceList(cands) {
+  var list = document.getElementById('source-page-list');
+  if (!list) return;
+
+  if (!cands.length) {
+    list.innerHTML = '<div class="search-empty">没有找到可用的 B 站音源</div>';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < cands.length; i++) {
+    var c = cands[i];
+    var cover = c.cover || '';
+    var img = cover
+      ? '<img src="' + biliEsc(cover) + '" alt="" loading="lazy" onerror="this.style.opacity=.2">'
+      : '<div class="sd-ph"></div>';
+
+    var durTxt = c.duration_s ? biliFmtTime(c.duration_s) : '';
+    var delta = '';
+    if (c.delta !== null && c.delta !== undefined) {
+      delta = '<span class="spc-delta">Δ' + (c.delta > 0 ? '+' : '') + c.delta + 's</span>';
+    }
+
+    var sc = Number(c.score) || 0;
+    var scoreCls = sc >= 60 ? 'high' : (sc >= 30 ? 'mid' : 'low');
+
+    var whyHtml = '';
+    var why = c.why || [];
+    for (var w = 0; w < why.length && w < 4; w++) {
+      var t = why[w];
+      var cls = 'n';
+      if (/精确|接近|MV区|白名单|官方/.test(t)) cls = 'good';
+      else if (/黑名单|偏离|非单曲|无关|超长/.test(t)) cls = 'bad';
+      whyHtml += '<span class="spc-why ' + cls + '">' + biliEsc(t) + '</span>';
+    }
+
+    html += '<div class="source-cand" data-cand-idx="' + i + '">' +
+        img +
+        '<div class="spc-info">' +
+          '<div class="spc-title">' + biliEsc(c.title || '') + '</div>' +
+          '<div class="spc-meta">' +
+            biliEsc(c.author || '') +
+            (durTxt ? ' · ' + durTxt : '') +
+            (c.playText ? ' · ' + biliEsc(c.playText) : '') +
+            delta +
+          '</div>' +
+          '<div class="spc-whys">' + whyHtml + '</div>' +
+        '</div>' +
+        '<div class="spc-score ' + scoreCls + '">' + Math.round(sc) + '</div>' +
+        '<button class="dl-btn spr-dl" type="button" title="下载这个音源" ' +
+          'data-dl-song="' + encodeURIComponent(JSON.stringify({bvid: c.bvid||"", cid: 0, name: (SRC_PAGE.song && SRC_PAGE.song.name)||"", artist: (SRC_PAGE.song && SRC_PAGE.song.artist)||"", duration: 0})) + '"' +
+          ' onclick="event.stopPropagation()">' +
+          '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+            '<path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M5 21h14"/></svg>' +
+        '</button>' +
+        '<button class="spc-play" type="button" title="播放这个音源">' +
+          '<svg width="15" height="15" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>' +
+        '</button>' +
+      '</div>';
+  }
+  list.innerHTML = html;
+
+  var rows = list.querySelectorAll('[data-cand-idx]');
+  for (var k = 0; k < rows.length; k++) {
+    (function (el) {
+      el.addEventListener('click', function () {
+        playSourceCandidate(parseInt(el.getAttribute('data-cand-idx'), 10), false);
+      });
+    })(rows[k]);
+  }
+}
+
+function playSourceCandidate(idx, auto) {
+  var c = SRC_PAGE.candidates[idx];
+  var song = SRC_PAGE.song;
+  if (!c || !song) return;
+
+  clearTimeout(SRC_PAGE.autoPlayTimer);
+
+  var rows = document.querySelectorAll('#source-page-list .source-cand');
+  for (var i = 0; i < rows.length; i++) {
+    rows[i].classList.toggle('cur', i === idx);
+  }
+
+  var item = makeBiliItem(song, c.bvid, 0);
+  item.biliCandidates = SRC_PAGE.candidates;
+  item.biliScore = c.score;
+  item.biliWhy = c.why;
+  if (c.duration) item.playbackDuration = c.duration;
+
+  pushAndPlay(item);
+
+  /* 播放后**不关闭找音源页** —— 用户可能想换一个候选再试试哪个音质好。
+     之前这里 setTimeout(closeSourcePage, 300)，
+     导致选完音源就跳回搜索结果，要再点一次歌。现在留在原地。 */
+}
+
+function refindSources() {
+  if (SRC_PAGE.song) openSourcePage(SRC_PAGE.song);
+}
+
+function closeSourcePage() {
+  clearTimeout(SRC_PAGE.autoPlayTimer);
+  SRC_PAGE.requestId++;
+
+  var page = document.getElementById('source-page');
+  if (page) {
+    page.classList.remove('show');
+    page.setAttribute('aria-hidden', 'true');
+  }
+  stopBottomBarGuard();
+
+  var sp = document.getElementById('search-page');
+  var stillOpen = !!(sp && sp.classList.contains('show'));
+  if (!stillOpen) document.body.classList.remove('search-page-open');
+}
+
+function goHomeFromSourcePage() {
+  clearTimeout(SRC_PAGE.autoPlayTimer);
+  SRC_PAGE.requestId++;
+  stopBottomBarGuard();
+
+  var a = document.getElementById('source-page');
+  if (a) { a.classList.remove('show'); a.setAttribute('aria-hidden', 'true'); }
+  var b = document.getElementById('search-page');
+  if (b) { b.classList.remove('show'); b.setAttribute('aria-hidden', 'true'); }
+  document.body.classList.remove('search-page-open');
+  SEARCH_UI.pageOpen = false;
+
+  try {
+    if (typeof goHome === 'function') goHome();
+  } catch (e) { /* 忽略 */ }
+}
+
+/* ==========================================================================
+   分P 面板
+   ========================================================================== */
+async function openPartsPanel(bvid) {
+  if (!bvid) return;
+
+  var old = document.getElementById('parts-panel');
+  if (old) old.parentNode.removeChild(old);
+
+  var d = document.createElement('div');
+  d.id = 'parts-panel';
+  d.className = 'parts-panel';
+  d.innerHTML = '<div class="pp-card">' +
+      '<div class="pp-head"><b>加载中…</b></div>' +
+      '<div class="pp-list"></div>' +
+    '</div>';
+  document.body.appendChild(d);
+
+  d.addEventListener('click', function (e) {
+    if (e.target === d) d.parentNode.removeChild(d);
+  });
+
+  try {
+    var r = await biliApiJson('/api/bili/parts?bvid=' + encodeURIComponent(bvid), { timeoutMs: 20000 });
+    var kind = r.kind || 'single';
+    var items = r.items || [];
+
+    var head = d.querySelector('.pp-head');
+    var list = d.querySelector('.pp-list');
+
+    if (kind === 'single' || items.length <= 1) {
+      head.innerHTML = '<b>' + biliEsc(r.title || '这个视频') + '</b><small>没有分P，直接播放即可</small>';
+      list.innerHTML = '';
+      if (items.length === 1) {
+        list.innerHTML = '<button class="pp-item" onclick="playPartItem(\'' +
+          biliEsc(bvid) + '\',' + (items[0].cid || 0) + ',\'' +
+          biliEsc(items[0].title || '').replace(/'/g, '&#39;') + '\',' +
+          (items[0].duration || 0) + ')">▶ 播放：' + biliEsc(items[0].title || r.title || '') + '</button>';
+      }
+      return;
+    }
+
+    head.innerHTML = '<b>' + biliEsc(r.title || '') + '</b><small>' +
+      items.length + ' 个' + (kind === 'season' ? '（合集）' : '（分P）') + '</small>';
+
+    /* 整单操作：100 集挨个点太累。
+       两个动作：
+         · 创建一个真歌单（保存到本地，能命名、能随时调出来）
+         · 或者只塞进当前播放队列（临时，关软件就没了） */
+    var actions = document.createElement('div');
+    actions.className = 'pp-actions';
+    actions.innerHTML =
+      '<button class="pp-action-btn" onclick="createPlaylistFromParts(\'' + biliEsc(bvid) + '\')">' +
+        '<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+          '<path d="M12 5v14"/><path d="M5 12h14"/></svg>' +
+        '创建歌单（' + items.length + ' 首）' +
+      '</button>' +
+      '<button class="pp-action-btn ghost" onclick="queueAllParts(\'' + biliEsc(bvid) + '\', true)">' +
+        '直接开始播' +
+      '</button>';
+    var card = d.querySelector('.pp-card');
+    if (card) card.insertBefore(actions, list);
+
+    var html = '';
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var target = it.bvid || bvid;
+      html += '<button class="pp-item" onclick="playPartItem(\'' +
+        biliEsc(target) + '\',' + (it.cid || 0) + ',\'' +
+        biliEsc(it.title || '').replace(/'/g, '&#39;') + '\',' +
+        (it.duration || 0) + ')">' +
+        '<span class="pp-idx">' + it.index + '</span>' +
+        '<span class="pp-name">' + biliEsc(it.title || ('P' + it.index)) + '</span>' +
+        (it.duration ? '<span class="pp-dur">' + biliFmtTime(it.duration) + '</span>' : '') +
+        '</button>';
+    }
+    list.innerHTML = html;
+  } catch (e) {
+    var h = d.querySelector('.pp-head');
+    if (h) h.innerHTML = '<b>加载失败</b><small>' + biliEsc(e && e.message ? e.message : '') + '</small>';
+  }
+}
+
+function playPartItem(bvid, cid, title, duration) {
+  var panel = document.getElementById('parts-panel');
+  if (panel) panel.parentNode.removeChild(panel);
+
+  var song = SRC_PAGE.song || {};
+  var item = makeBiliItem(song, bvid, cid);
+  item.name = title || item.name;
+  if (duration) item.duration = duration * 1000;
+
+  // 只关分P弹层，不关整页搜索（让用户能接着挑别的）
+  pushAndPlay(item);
+}
+
+/* ---------------------------------------------------------------- 整单操作 */
+/**
+ * 把分P / 合集的所有条目一次性变成播放队列。
+ * 100 集的合集挨个点太累，这个函数解决它。
+ *
+ * 队列项的 bvid/cid 都带上了，播放时不用再搜音源，直接取流。
+ */
+async function queueAllParts(bvid, autoplay) {
+  var panel = document.getElementById('parts-panel');
+  try {
+    var r = await biliApiJson('/api/bili/parts?bvid=' + encodeURIComponent(bvid), { timeoutMs: 25000 });
+    var items = r.items || [];
+    if (!items.length) {
+      if (typeof showToast === 'function') showToast('这个视频没有分P');
+      return;
+    }
+
+    var song = SRC_PAGE.song || {};
+    var baseName = song.name || r.title || '';
+
+    // 构造队列项
+    var queueItems = items.map(function (it) {
+      var it2 = makeBiliItem({
+        name: it.title || baseName,
+        artist: song.artist || r.owner || '',
+        album: song.album || '',
+        cover: it.pic || song.cover || '',
+        duration: (it.duration || 0) * 1000,
+        duration_s: it.duration || 0,
+      }, it.bvid || bvid, it.cid || 0);
+      // 显示用：歌名取分P标题（去掉序号前缀）
+      it2.name = String(it.title || ('P' + it.index)).replace(/^\d+[.、\s]+/, '');
+      return it2;
+    });
+
+    if (typeof playQueue === 'undefined') {
+      if (typeof showToast === 'function') showToast('播放队列不可用');
+      return;
+    }
+
+    /* 入队策略：
+         用 unshift 会把整个列表倒序，所以先把队列项反转再逐个 unshift。
+         然后让第一首在队首。 */
+    var reversed = queueItems.slice().reverse();
+    for (var i = 0; i < reversed.length; i++) playQueue.unshift(reversed[i]);
+
+    if (panel) panel.parentNode.removeChild(panel);
+    closeSearchPage();
+
+    if (autoplay) {
+      currentIdx = 0;
+      if (typeof playQueueAt === 'function') playQueueAt(0);
+    } else {
+      if (typeof renderQueue === 'function') { try { renderQueue(); } catch (e) {} }
+      if (typeof showToast === 'function') {
+        showToast('已加入 ' + queueItems.length + ' 首到播放队列');
+      }
+    }
+  } catch (e) {
+    console.warn('[queueAllParts]', e);
+    if (typeof showToast === 'function') showToast('加载分P失败');
+  }
+}
+
+function playAllParts(bvid) {
+  queueAllParts(bvid, true);
+}
+
+/* ---------------------------------------------------------------- 创建歌单 */
+/**
+ * 把一个分P / 合集变成一个真歌单（存在本地 data/local-playlists.json）。
+ *
+ * 流程：取分P列表 → 弹一个输入框让用户命名 → 存本地 → 提示成功
+ */
+async function createPlaylistFromParts(bvid) {
+  var panel = document.getElementById('parts-panel');
+  try {
+    var r = await biliApiJson('/api/bili/parts?bvid=' + encodeURIComponent(bvid), { timeoutMs: 25000 });
+    var items = r.items || [];
+    if (!items.length) {
+      if (typeof showToast === 'function') showToast('这个视频没有分P');
+      return;
+    }
+
+    var song = SRC_PAGE.song || {};
+    var defaultName = (r.title || song.name || '新建歌单').slice(0, 40);
+
+    // 命名对话框
+    var name = await askPlaylistName(defaultName, items.length);
+    if (name === null) return;   // 用户取消
+
+    // 组装歌曲
+    var songs = items.map(function (it) {
+      return {
+        bvid: it.bvid || bvid,
+        cid: it.cid || 0,
+        name: String(it.title || ('P' + it.index)).replace(/^\d+[.、\s]+/, ''),
+        artist: song.artist || r.owner || '',
+        album: '',
+        cover: it.pic || song.cover || '',
+        duration: (it.duration || 0) * 1000,
+        duration_s: it.duration || 0,
+      };
+    });
+
+    var res = await fetch('/api/local-pl/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, songs: songs }),
+    }).then(function (x) { return x.json(); });
+
+    if (panel) panel.parentNode.removeChild(panel);
+
+    if (res && res.id) {
+      if (typeof showToast === 'function') {
+        showToast('已创建歌单「' + res.name + '」，共 ' + songs.length + ' 首');
+      }
+      // 通知其他地方刷新歌单列表（如果有监听）
+      try {
+        window.dispatchEvent(new CustomEvent('bili:playlist-created', { detail: res }));
+      } catch (e) {}
+    } else {
+      if (typeof showToast === 'function') showToast('创建失败：' + (res && res.error || '未知错误'));
+    }
+  } catch (e) {
+    console.warn('[createPlaylistFromParts]', e);
+    if (typeof showToast === 'function') showToast('创建歌单失败');
+  }
+}
+
+/**
+ * 弹一个小的命名对话框。返回 Promise<string|null>。
+ * 用自有 DOM，不用 window.prompt（Electron 里 prompt 被禁用了）。
+ */
+function askPlaylistName(defaultName, count) {
+  return new Promise(function (resolve) {
+    var old = document.getElementById('pl-name-dialog');
+    if (old) old.parentNode.removeChild(old);
+
+    var d = document.createElement('div');
+    d.id = 'pl-name-dialog';
+    d.className = 'pl-name-mask';
+    d.innerHTML =
+      '<div class="pl-name-card">' +
+        '<div class="pl-name-title">创建歌单</div>' +
+        '<div class="pl-name-sub">共 ' + count + ' 首，保存到本地</div>' +
+        '<input id="pl-name-input" type="text" maxlength="60" autocomplete="off" spellcheck="false">' +
+        '<div class="pl-name-actions">' +
+          '<button type="button" class="pl-name-btn ghost" data-act="cancel">取消</button>' +
+          '<button type="button" class="pl-name-btn" data-act="ok">创建</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(d);
+
+    var inp = d.querySelector('#pl-name-input');
+    inp.value = defaultName;
+    setTimeout(function () {
+      inp.focus();
+      inp.select();
+    }, 50);
+
+    function done(val) {
+      if (d.parentNode) d.parentNode.removeChild(d);
+      resolve(val);
+    }
+
+    d.querySelector('[data-act="cancel"]').onclick = function () { done(null); };
+    d.querySelector('[data-act="ok"]').onclick = function () {
+      var v = inp.value.trim();
+      done(v || defaultName);
+    };
+    d.addEventListener('click', function (e) {
+      if (e.target === d) done(null);
+    });
+    inp.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        var v = inp.value.trim();
+        done(v || defaultName);
+      } else if (e.key === 'Escape') {
+        done(null);
+      }
+      e.stopPropagation();   // 别让全局 ESC 关掉上层页面
+    });
+  });
+}
+
+/* ==========================================================================
+   事件绑定
+   ========================================================================== */
+function searchSubmit() {
+  var inp = document.getElementById('search-input');
+  var q = inp ? inp.value.trim() : '';
+  if (!q) return;
+  openSearchPage(q);
+}
+
+/* 搜索页里的放大镜（和主页那个一样的逻辑） */
+function searchPageSubmit() {
+  var inp = document.getElementById('search-page-input');
+  var q = inp ? inp.value.trim() : '';
+  if (!q) {
+    inp && inp.focus();
+    return;
+  }
+  runSearchUi(q, { forPage: true, page: 1 });
+}
+
+(function bindSearchUi() {
+  var tries = 0;
+
+  function bind() {
+    var inp = document.getElementById('search-input');
+    if (!inp) {
+      if (++tries < 60) setTimeout(bind, 200);
+      return;
+    }
+
+    var timer = null;
+    inp.addEventListener('input', function () {
+      var q = inp.value.trim();
+      clearTimeout(timer);
+      if (!q) {
+        var box = document.getElementById('search-results');
+        if (box) box.classList.remove('show');
+        return;
+      }
+      timer = setTimeout(function () { runSearchUi(q, { forDropdown: true }); }, 420);
+    });
+
+    inp.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        searchSubmit();
+      } else if (e.key === 'Escape') {
+        var box = document.getElementById('search-results');
+        if (box) box.classList.remove('show');
+        inp.blur();
+      }
+    });
+
+    var pageInp = document.getElementById('search-page-input');
+    if (pageInp) {
+      var t2 = null;
+      pageInp.addEventListener('input', function () {
+        var q = pageInp.value.trim();
+        clearTimeout(t2);
+        if (!q) {
+          var list = document.getElementById('search-page-list');
+          if (list) list.innerHTML = '';
+          var st = document.getElementById('search-page-status');
+          if (st) st.textContent = '';
+          return;
+        }
+        t2 = setTimeout(function () { runSearchUi(q, { forPage: true, page: 1 }); }, 420);
+      });
+      pageInp.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          var q = pageInp.value.trim();
+          if (q) runSearchUi(q, { forPage: true, page: 1 });
+        } else if (e.key === 'Escape') {
+          closeSearchPage();
+        }
+      });
+    }
+
+    document.addEventListener('click', function (e) {
+      var box = document.getElementById('search-results');
+      var stack = document.getElementById('search-stack');
+      if (box && stack && !stack.contains(e.target)) box.classList.remove('show');
+
+      var sel = document.getElementById('search-mode-select');
+      if (sel && !sel.contains(e.target)) {
+        sel.classList.remove('open');
+        sel.setAttribute('aria-expanded', 'false');
+      }
+    });
+
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') {
+        if (SRC_PAGE.song && document.getElementById('source-page') &&
+            document.getElementById('source-page').classList.contains('show')) {
+          closeSourcePage();
+        } else if (SEARCH_UI.pageOpen) {
+          closeSearchPage();
+        }
+      }
+    });
+
+    setSearchUiMode('precise');
+  }
+
+  bind();
+})();
+
+/* ==========================================================================
+   自检（给开发期排查用）
+   --------------------------------------------------------------------------
+   Electron 禁用了 F12，看不到控制台。
+   这个函数把关键数据直接画在屏幕上，用户截图就能给我看。
+   ========================================================================== */
+function biliSelfCheck() {
+  var out = [];
+  function line(k, v) { out.push(k + ': ' + v); }
+
+  line('devicePixelRatio', window.devicePixelRatio);
+  line('innerWidth x innerHeight', window.innerWidth + ' x ' + window.innerHeight);
+  line('body.zoom', getComputedStyle(document.body).zoom || 'none');
+  line('body.transform', getComputedStyle(document.body).transform);
+
+  var ids = ['sms-btn', 'search-input', 'search-go', 'search-mode-select', 'user-btn', 'home-btn'];
+  ids.forEach(function (id) {
+    var el = document.getElementById(id);
+    if (!el) { line(id, '不存在'); return; }
+    var r = el.getBoundingClientRect();
+    var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    var hit = document.elementFromPoint(cx, cy);
+    var hitDesc = hit ? (hit.tagName + (hit.id ? '#' + hit.id : '') + (hit.className ? '.' + String(hit.className).split(' ')[0] : '')) : 'null';
+    var cs = getComputedStyle(el);
+    line(id, 'rect=[' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) + ']' +
+      ' hit=' + hitDesc +
+      ' pe=' + cs.pointerEvents +
+      ' region=' + (cs.webkitAppRegion || 'none') +
+      ' vis=' + cs.visibility);
+  });
+
+  // 检查搜索页状态
+  var sp = document.getElementById('search-page');
+  line('search-page.show', sp ? sp.classList.contains('show') : 'none');
+  line('body.search-page-open', document.body.classList.contains('search-page-open'));
+  var bar = document.getElementById('bottom-bar');
+  if (bar) {
+    var bcs = getComputedStyle(bar);
+    var br = bar.getBoundingClientRect();
+    line('bottom-bar', 'class=' + bar.className + ' opacity=' + bcs.opacity +
+      ' vis=' + bcs.visibility + ' z=' + bcs.zIndex +
+      ' h=' + Math.round(br.height) + ' y=' + Math.round(br.top));
+  } else {
+    line('bottom-bar', '不存在');
+  }
+
+  // 显示到屏幕
+  var old = document.getElementById('bili-selfcheck');
+  if (old) old.parentNode.removeChild(old);
+  var d = document.createElement('div');
+  d.id = 'bili-selfcheck';
+  d.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.94);' +
+    'color:#0f0;font:12px/1.7 Consolas,monospace;padding:24px;overflow:auto;white-space:pre-wrap;cursor:pointer';
+  d.textContent = '点击任意处关闭\n\n' + out.join('\n');
+  d.onclick = function () { d.parentNode.removeChild(d); };
+  document.body.appendChild(d);
+}
+
+/* 全局热键：Ctrl+Alt+D 打开自检 */
+document.addEventListener('keydown', function (e) {
+  if (e.ctrlKey && e.altKey && (e.key === 'd' || e.key === 'D')) {
+    e.preventDefault();
+    biliSelfCheck();
+  }
+});
+/* ==========================================================================
+   搜索页常驻播放条
+   --------------------------------------------------------------------------
+   自检发现：打开搜索页时 bottom-bar 的 class 是 "visible soft-hidden"，
+   soft-hidden 把 opacity 设成 0，所以看不见。
+
+   光靠 CSS 覆盖不够（Mineradio 的 JS 会重新加回 soft-hidden），
+   所以这里直接操作 class：去掉 soft-hidden / controls-hidden。
+   ========================================================================== */
+function forceShowBottomBar() {
+  var bar = document.getElementById('bottom-bar');
+  if (!bar) return false;
+  bar.classList.remove('soft-hidden', 'controls-hidden');
+  bar.classList.add('visible');
+
+  // 同时告诉 Mineradio 自己的状态机：不要隐藏
+  try {
+    if (typeof setControlsHidden === 'function') setControlsHidden(false);
+  } catch (e) { /* 忽略 */ }
+  return true;
+}
+
+/* 持续保持（Mineradio 可能在某些时机又加回 soft-hidden） */
+var _bottomBarGuard = null;
+function startBottomBarGuard() {
+  stopBottomBarGuard();
+  forceShowBottomBar();
+  _bottomBarGuard = setInterval(forceShowBottomBar, 400);
+}
+function stopBottomBarGuard() {
+  if (_bottomBarGuard) {
+    clearInterval(_bottomBarGuard);
+    _bottomBarGuard = null;
+  }
+}
+/* ==========================================================================
+   自定义确认框
+   --------------------------------------------------------------------------
+   Electron 里原生 confirm() 会阻塞整个渲染进程 ——
+   表现就是弹框弹出时播放器卡住、粒子动画停住。
+   所以所有确认都要用这个异步版本。
+   ========================================================================== */
+function askConfirm(title, message, okText) {
+  return new Promise(function (resolve) {
+    var old = document.getElementById('bili-confirm');
+    if (old) old.parentNode.removeChild(old);
+
+    var d = document.createElement('div');
+    d.id = 'bili-confirm';
+    d.className = 'bili-confirm-mask';
+    d.innerHTML =
+      '<div class="bili-confirm-card">' +
+        '<div class="bili-confirm-title">' + biliEsc(title) + '</div>' +
+        '<div class="bili-confirm-msg">' + biliEsc(message) + '</div>' +
+        '<div class="bili-confirm-actions">' +
+          '<button type="button" class="bili-confirm-btn ghost" data-act="cancel">取消</button>' +
+          '<button type="button" class="bili-confirm-btn danger" data-act="ok">' + biliEsc(okText || '确定') + '</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(d);
+
+    function done(v) {
+      if (d.parentNode) d.parentNode.removeChild(d);
+      resolve(v);
+    }
+    d.querySelector('[data-act="cancel"]').onclick = function () { done(false); };
+    d.querySelector('[data-act="ok"]').onclick = function () { done(true); };
+    d.addEventListener('click', function (e) { if (e.target === d) done(false); });
+
+    // ESC 关闭（捕获阶段，别让它关掉上层页面）
+    function onKey(e) {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        document.removeEventListener('keydown', onKey, true);
+        done(false);
+      }
+    }
+    document.addEventListener('keydown', onKey, true);
+  });
+}
+
+/* 打开一行的「加入歌单」小菜单 */
+function showAddToPlaylistMenu(anchorEl, song) {
+  var old = document.getElementById('bili-add-menu');
+  if (old) old.parentNode.removeChild(old);
+
+  var d = document.createElement('div');
+  d.id = 'bili-add-menu';
+  d.className = 'bili-add-menu';
+
+  var r = anchorEl.getBoundingClientRect();
+  d.style.left = Math.max(8, Math.min(r.left - 140, window.innerWidth - 230)) + 'px';
+  d.style.top = Math.min(r.bottom + 6, window.innerHeight - 260) + 'px';
+
+  var html = '<div class="bam-head">加入歌单</div><div class="bam-list">';
+  if (!LOCAL_PLAYLISTS || !LOCAL_PLAYLISTS.length) {
+    html += '<div class="bam-empty">还没有歌单</div>';
+  } else {
+    for (var i = 0; i < LOCAL_PLAYLISTS.length; i++) {
+      var p = LOCAL_PLAYLISTS[i];
+      html += '<button type="button" data-bam-id="' + biliEsc(p.id) + '">' +
+          '<span>' + biliEsc(p.name) + '</span>' +
+          '<small>' + (p.count || 0) + ' 首</small>' +
+        '</button>';
+    }
+  }
+  html += '</div>';
+  html += '<button type="button" class="bam-new" data-bam-new="1">＋ 新建歌单并加入</button>';
+  d.innerHTML = html;
+  document.body.appendChild(d);
+
+  d.addEventListener('click', function (e) {
+    var t = e.target.closest('[data-bam-id]');
+    if (t) {
+      addSongToLocalPlaylist(t.getAttribute('data-bam-id'), song);
+      d.parentNode.removeChild(d);
+      return;
+    }
+    if (e.target.closest('[data-bam-new]')) {
+      d.parentNode.removeChild(d);
+      askPlaylistName(song.name || '新歌单', 1).then(function (name) {
+        if (!name) return;
+        fetch('/api/local-pl/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, songs: [normalizeSongForPlaylist(song)] }),
+        }).then(function (r) { return r.json(); }).then(function (res) {
+          if (res && res.id) {
+            if (typeof showToast === 'function') showToast('已创建并加入「' + res.name + '」');
+            if (typeof loadLocalPlaylists === 'function') loadLocalPlaylists();
+          }
+        });
+      });
+    }
+  });
+
+  setTimeout(function () {
+    document.addEventListener('click', function close() {
+      var m = document.getElementById('bili-add-menu');
+      if (m) m.parentNode.removeChild(m);
+      document.removeEventListener('click', close);
+    }, { once: true });
+  }, 10);
+}
+
+function normalizeSongForPlaylist(song) {
+  song = song || {};
+  /* 关键：只能把真正的 B站 bvid 存进 bvid 字段。
+     精确搜索出来的是曲库曲目（QQ 音乐的 mid），像 0027oMO61wWi55_0 这种
+     不是 B站 bvid，存进去播放时会「当前没有可用音源」。
+     这种情况 bvid 留空，播放时后台按歌名+歌手+时长重新找音源。 */
+  var realBvid = /^BV[0-9A-Za-z]{10}$/.test(String(song.bvid || '')) ? song.bvid : '';
+  return {
+    bvid: realBvid,
+    cid: realBvid ? (song.cid || 0) : 0,
+    mid: song.mid || '',            // 曲库 mid，找音源时能加速
+    name: song.name || song.title || '',
+    artist: song.artist || '',
+    album: song.album || '',
+    cover: song.cover || song.picUrl || '',
+    duration: song.duration || 0,
+    duration_s: song.duration_s || Math.round((song.duration || 0) / 1000),
+  };
+}
+
+function addSongToLocalPlaylist(playlistId, song) {
+  fetch('/api/local-pl/add', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: playlistId, songs: [normalizeSongForPlaylist(song)] }),
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (res && res.ok) {
+        if (typeof showToast === 'function') showToast('已加入歌单（共 ' + res.count + ' 首）');
+        if (typeof loadLocalPlaylists === 'function') loadLocalPlaylists();
+      } else {
+        if (typeof showToast === 'function') showToast('加入失败');
+      }
+    })
+    .catch(function () {
+      if (typeof showToast === 'function') showToast('加入失败');
+    });
+}
