@@ -1,7 +1,7 @@
 {
   "name": "mineradio",
   "productName": "Mineradio",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "OnlyEars 音乐播放器 —— 一款只能听不能看的视频软件，从 Bilibili 获取音源。基于 Mineradio 创作。",
   "author": "OnlyEars (based on Mineradio by XxHuberrr)",
   "license": "GPL-3.0-only",

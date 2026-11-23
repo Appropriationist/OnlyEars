@@ -358,15 +358,19 @@ function showAddToPlaylistMenu(anchorEl, song) {
   d.innerHTML = html;
   document.body.appendChild(d);
 
+  /* 菜单内部点击：必须阻止冒泡，否则会触发「外部点击关闭」，
+     导致菜单在添加动作完成前就被移除。 */
   d.addEventListener('click', function (e) {
+    e.stopPropagation();
+
     var t = e.target.closest('[data-bam-id]');
     if (t) {
       addSongToLocalPlaylist(t.getAttribute('data-bam-id'), song);
-      d.parentNode.removeChild(d);
+      removeAddMenu();
       return;
     }
     if (e.target.closest('[data-bam-new]')) {
-      d.parentNode.removeChild(d);
+      removeAddMenu();
       askPlaylistName(song.name || '新歌单', 1).then(function (name) {
         if (!name) return;
         fetch('/api/local-pl/create', {
@@ -377,20 +381,36 @@ function showAddToPlaylistMenu(anchorEl, song) {
           if (res && res.id) {
             if (typeof showToast === 'function') showToast('已创建并加入「' + res.name + '」');
             if (typeof loadLocalPlaylists === 'function') loadLocalPlaylists();
+          } else {
+            if (typeof showToast === 'function') showToast('创建失败：' + ((res && res.error) || '未知错误'));
           }
+        }).catch(function () {
+          if (typeof showToast === 'function') showToast('创建失败');
         });
       });
     }
   });
 
+  /* 外部点击关闭：用捕获阶段 + 判断是否点在菜单内部。
+     原来的 once 监听会把菜单自身的点击也当成外部点击。 */
   setTimeout(function () {
-    document.addEventListener('click', function close() {
+    function onOutsideClick(ev) {
       var m = document.getElementById('bili-add-menu');
-      if (m) m.parentNode.removeChild(m);
-      document.removeEventListener('click', close);
-    }, { once: true });
+      if (!m) { document.removeEventListener('pointerdown', onOutsideClick, true); return; }
+      if (m.contains(ev.target)) return;
+      removeAddMenu();
+      document.removeEventListener('pointerdown', onOutsideClick, true);
+    }
+    document.addEventListener('pointerdown', onOutsideClick, true);
   }, 10);
 }
+
+/** 关闭「加入歌单」菜单 */
+function removeAddMenu() {
+  var m = document.getElementById('bili-add-menu');
+  if (m && m.parentNode) m.parentNode.removeChild(m);
+}
+
 
 function normalizeSongForPlaylist(song) {
   song = song || {};

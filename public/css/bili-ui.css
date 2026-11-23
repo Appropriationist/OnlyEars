@@ -3968,3 +3968,49 @@ html body .pl-name-btn:disabled {
   transform: none !important;
   box-shadow: none;
 }
+
+
+
+/* ==========================================================================
+   歌单列表滚动
+   --------------------------------------------------------------------------
+   之前失败的原因：
+     1. 只给 #pl-list 加 overflow:auto → 拿不到高度，不生效
+     2. 给 #pl-pane 加固定 height → 面板被撑高，遮住左侧热评
+
+   现在：直接给 #pl-list 一个 max-height。
+     · 歌曲少 → 自然高度，面板不变高
+     · 歌曲多 → 超过 max-height 就滚动
+   ========================================================================== */
+
+html body #pl-list {
+  max-height: min(40vh, 340px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+}
+
+/* 滚动条 */
+html body #pl-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+html body #pl-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+html body #pl-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .16);
+  border-radius: 2px;
+}
+
+html body #pl-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, .30);
+}
+
+/* 详情头部不吸顶（跟 Mineradio 原版一致） */
+html body #pl-list .lpl-detail-head {
+  position: static;
+  background: transparent;
+}

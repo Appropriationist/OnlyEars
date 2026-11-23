@@ -5039,7 +5039,13 @@ const server = http.createServer(async (req, res) => {
     try {
       if (req.method !== 'POST') { sendJSON(res, { error: 'METHOD_NOT_ALLOWED' }, 405); return; }
       const body = await readRequestBody(req);
-      const pl = localPlaylist.removeSong(body.id, body.bvid, body.cid);
+      /* 支持两种定位方式：
+         · { bvid, cid }      有 bvid 的歌
+         · { name, artist }   无 bvid 的歌（精确搜索来的曲库曲目） */
+      const target = body.bvid
+        ? { bvid: body.bvid, cid: body.cid }
+        : { name: body.name, artist: body.artist };
+      const pl = localPlaylist.removeSong(body.id, target);
       if (!pl) { sendJSON(res, { error: 'NOT_FOUND' }, 404); return; }
       sendJSON(res, { ok: true, playlist: pl });
     } catch (err) {

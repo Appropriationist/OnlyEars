@@ -9,9 +9,9 @@
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![Based on Mineradio](https://img.shields.io/badge/based%20on-Mineradio-ff69b4.svg)](https://github.com/XxHuberrr/Mineradio-paused)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-00A1D6.svg)]()
-[![Version](https://img.shields.io/badge/version-1.0.0-success.svg)](../../releases)
+[![Version](https://img.shields.io/badge/version-1.0.1-success.svg)](../../releases)
 
-[下载](#下载) · [功能详解](#功能详解) · [截图](#截图) · [常见问题](#常见问题) · [反馈](#反馈)
+[下载](#下载) · [功能详解](#功能详解) · [截图](#截图) · [常见问题](#常见问题) · [更新日志](CHANGELOG.md) · [反馈](#反馈)
 
 </div>
 
@@ -383,15 +383,6 @@ zyl2012_音乐无限 · 5:02 · 655.5万 · Δ+3s
 > ⚠️ **不要解压到 `C:\Program Files`**
 >
 > 那里需要管理员权限，Electron 写入缓存会失败，表现为启动后白屏或功能异常。
-
-### 国内备用：夸克网盘
-
-如果 GitHub 访问困难：
-
-- **链接**：https://pan.quark.cn/s/837061c6b986
-- **提取码**：`3ieX`
-
-> 网盘可能限速，或因为下载量被判为异常而临时失效。建议优先用 Releases。
 
 ---
 

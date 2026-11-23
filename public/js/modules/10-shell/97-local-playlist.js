@@ -69,6 +69,33 @@ function syncLocalPlaylistsIntoPanel() {
     return;
   }
 
+  /* 保存滚动位置：重写 innerHTML 会让外层 #playlist-panel 的 scrollTop 归零。
+     渲染后立刻恢复，减少「滚着滚着跳回顶部」的感觉。 */
+  var panel = document.getElementById('playlist-panel');
+  var savedTop = panel ? panel.scrollTop : 0;
+
+  _syncLocalPlaylistsIntoPanelInner(list);
+
+  if (panel && savedTop > 0) {
+    panel.scrollTop = savedTop;
+    // 有些情况下同步设置会被布局重算覆盖，再补一次
+    requestAnimationFrame(function () {
+      if (panel.scrollTop !== savedTop) panel.scrollTop = savedTop;
+    });
+  }
+}
+
+function _syncLocalPlaylistsIntoPanelInner(list) {
+  var list = document.getElementById('pl-list');
+  if (!list) {
+    setTimeout(syncLocalPlaylistsIntoPanel, CFG.PLAYLIST_RETRY);
+    return;
+  }
+  if (list.offsetParent === null) {
+    setTimeout(syncLocalPlaylistsIntoPanel, CFG.PLAYLIST_RETRY);
+    return;
+  }
+
   if (LPL_VIEW.mode === 'detail') {
     renderLocalDetailView(list);
     return;
@@ -254,7 +281,13 @@ function removeLocalPlaylistSong(idx) {
     fetch('/api/local-pl/remove', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: LPL_VIEW.id, bvid: s.bvid, cid: s.cid || 0 }),
+        body: JSON.stringify({
+          id: LPL_VIEW.id,
+          bvid: s.bvid || '',
+          cid: s.cid || 0,
+          name: s.name || '',
+          artist: s.artist || '',
+        }),
     }).then(function (r) { return r.json(); }).then(function () {
       if (typeof showToast === 'function') showToast('已移除');
       openLocalPlaylistDetail(LPL_VIEW.id);

@@ -145,21 +145,54 @@ function addSongs(id, songs) {
 }
 
 /* ---------------------------------------------------------------- 删歌 */
-function removeSong(id, bvid, cid) {
+/**
+ * 从歌单移除一首。
+ *
+ * @param {string} id     歌单 id
+ * @param {object} target 可以是 { bvid, cid } 也可以是 { name, artist }
+ *                        没有 bvid 的曲目（精确搜索来的）必须用 name+artist 定位
+ */
+function removeSong(id, target) {
   const s = readStore();
   const pl = s.playlists.find(p => p.id === id);
   if (!pl) return null;
-  const target = songKey({ bvid, cid });
-  pl.songs = (pl.songs || []).filter(x => songKey(x) !== target);
+
+  target = target || {};
+  const key = songKey(target);
+  pl.songs = (pl.songs || []).filter(x => songKey(x) !== key);
+
   pl.updatedAt = Date.now();
   writeStore(s);
   return pl;
 }
 
 /* ---------------------------------------------------------------- 工具 */
+/**
+ * 歌曲的唯一键，用于去重。
+ *
+ * 优先级：
+ *   1. 有 bvid → "bvid|cid"（最可靠，能区分同一首歌的不同音源）
+ *   2. 无 bvid → "name|artist"（精确搜索来的曲库曲目没有 bvid，
+ *      必须靠歌名+歌手区分，否则所有无 bvid 的歌会被当成同一首）
+ */
 function songKey(s) {
   s = s || {};
-  return String(s.bvid || s.id || '') + '|' + String(s.cid || 0);
+  const bvid = String(s.bvid || s.id || '').trim();
+  if (bvid) return bvid + '|' + String(s.cid || 0);
+
+  /* 没有 bvid：用歌名 + 歌手（归一化：去空格、小写、去括号内容） */
+  const norm = (v) => String(v || '')
+    .toLowerCase()
+    .replace(/[（(【\[].*?[）)】\]]/g, '')
+    .replace(/\s+/g, '')
+    .trim();
+
+  const name = norm(s.name || s.title);
+  const artist = norm(s.artist);
+  if (name) return 'n:' + name + '|a:' + artist;
+
+  /* 连歌名都没有：退化成随机键，避免误判为重复 */
+  return 'u:' + Math.random().toString(36).slice(2) + '|' + Date.now();
 }
 
 function normalizeSongs(list) {
